@@ -6,10 +6,43 @@ stretches in the direction it travels and settles back into its normal shape
 when it arrives. The motion model is ported from
 [GregTheMadMonk/alacritty-smooth-cursor](https://github.com/GregTheMadMonk/alacritty-smooth-cursor).
 
-<!-- TODO: record a demo, save it as assets/demo.gif and uncomment the line below
 ![kitty smooth cursor demo](assets/demo.gif)
--->
-_Demo GIF coming soon._
+
+## Install
+
+```sh
+git clone https://github.com/SunqdXX/kitty-smooth-cursor.git
+cd kitty-smooth-cursor
+./install.sh
+```
+
+Then run `kitty-smooth`, or pick **kitty (smooth cursor)** in your app launcher.
+That's it.
+
+`install.sh` does the following:
+
+1. Checks kitty's build dependencies. On Arch Linux it offers to install
+   missing ones with `pacman`; on other distributions it lists them (see
+   [kitty's build docs](https://sw.kovidgoyal.net/kitty/build/)).
+2. Downloads `slangc`, the shader compiler kitty 0.49+ needs, and the Symbols
+   Nerd Font Mono if you don't have them. Both stay inside the repo folder.
+3. Clones kitty into `./kitty`, applies the patch to the newest kitty release
+   and builds it. The first build takes a few minutes.
+4. Installs it to `~/.local/kitty-smooth`. It also adds a `kitty-smooth`
+   launcher to `~/.local/bin` that starts it with smooth motion on, and a
+   desktop entry.
+
+A kitty installed by your package manager is never touched. The HTML docs and
+man pages are skipped, since building them needs Sphinx.
+
+| Command | What it does |
+|---------|--------------|
+| `./install.sh` | Install, or update to the newest kitty release |
+| `./install.sh v0.49.2` | Build a specific kitty tag, branch or commit |
+| `./install.sh --uninstall` | Remove everything it installed |
+
+Set `PREFIX` and `BINDIR` to install somewhere other than `~/.local/kitty-smooth`
+and `~/.local/bin`.
 
 ## How it differs from kitty's `cursor_trail`
 
@@ -54,46 +87,9 @@ single-cell moves; the difference comes from the distance alone. With the
 defaults, a single-cell move settles in about 0.3 s and a jump across the
 screen in about 0.7 s.
 
-## Building
-
-You need the usual [kitty build dependencies](https://sw.kovidgoyal.net/kitty/build/),
-plus:
-
-- `git`, Go and Python 3
-- `slangc` from [shader-slang](https://github.com/shader-slang/slang). kitty
-  0.49 and later compile their shaders with it.
-- The Symbols Nerd Font Mono font, which the kitty build bundles
-
-On Arch Linux, installing the `kitty` package pulls in the runtime libraries.
-The rest is:
-
-```sh
-sudo pacman -Syu --needed base-devel git go python shader-slang ttf-nerd-fonts-symbols-mono
-```
-
-Then, from a clone of this repository:
-
-```sh
-./rebuild-kitty-smooth.sh            # newest kitty release
-./rebuild-kitty-smooth.sh v0.49.2    # or a specific tag, branch or commit
-```
-
-The script does the following:
-
-1. Clones kitty into `./kitty`.
-2. Checks out the requested version and applies the patch.
-3. Builds kitty and installs it to `$HOME/.local/kitty-smooth`. Set `PREFIX` to
-   install somewhere else.
-
-A kitty installed by your package manager is not touched. The HTML docs and
-man pages are skipped, since building them needs Sphinx.
-
-If `slangc` is not packaged for your distribution, unpack a
-[slang release](https://github.com/shader-slang/slang/releases) into
-`./toolchain/slang`. The script picks up `./toolchain/slang/bin/slangc`
-automatically.
-
 ### Building by hand
+
+If you'd rather apply the patch yourself:
 
 ```sh
 git clone https://github.com/kovidgoyal/kitty.git
@@ -105,14 +101,17 @@ python3 setup.py build            # development build, run with ./kitty/launcher
 
 ## Usage
 
-```sh
-~/.local/kitty-smooth/bin/kitty -o cursor_smooth_motion=yes
-```
+`kitty-smooth` starts the patched kitty with `cursor_smooth_motion` on and
+passes any other arguments through. It reads your normal `kitty.conf`, so tune
+the animation there with the options below. An unpatched kitty reading the
+same config only logs `Ignoring unknown config key`, so one `kitty.conf` can
+serve both.
 
-To enable it permanently, add `cursor_smooth_motion yes` to `kitty.conf`. An
-unpatched kitty reading the same config only logs
-`Ignoring unknown config key`, so one `kitty.conf` can serve both. If you use
-`cursor_trail`, turn it off in the patched kitty (`-o cursor_trail=0`).
+The patched binary itself is `~/.local/kitty-smooth/bin/kitty`. Run directly,
+it follows `cursor_smooth_motion` from `kitty.conf`, which is off by default.
+
+If you use `cursor_trail`, turn it off for the smooth cursor
+(`kitty-smooth -o cursor_trail=0`). Both together look doubled.
 
 ## Options
 
@@ -137,14 +136,13 @@ If you used alacritty-smooth-cursor, its settings map like this:
 
 ## Updating after a kitty release
 
-Run the script again:
-
 ```sh
-./rebuild-kitty-smooth.sh
+git pull
+./install.sh
 ```
 
-It resets `./kitty`, checks out the newest release tag and re-applies the patch
-with `git apply --3way`. When upstream has changed the code around a hunk, a
+The script resets `./kitty`, checks out the newest release tag and re-applies
+the patch with `git apply --3way`. When upstream has changed the code around a hunk, a
 plain `git apply` fails, but `--3way` can still merge it. For that it needs the
 history of the version the patch was made against (v0.49.2), so keep `./kitty`
 a full clone, not a shallow one.
