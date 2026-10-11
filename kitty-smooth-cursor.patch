@@ -1,0 +1,814 @@
+kitty: smooth cursor motion, ported from alacritty-smooth-cursor
+
+Port of the smooth cursor animation from
+https://github.com/GregTheMadMonk/alacritty-smooth-cursor (patch/smooth-cursor
+branch, commit 6d1c2604) to kitty. Made against kitty v0.49.2.
+
+The cursor is drawn as a rectangle whose edges ease exponentially towards the
+real cursor, leading edges faster than trailing ones, so it stretches while it
+moves. While animating, the real cursor is hidden and the rectangle is drawn
+over the finished frame, sampling it to keep the text below readable.
+
+New options (all off/default unless set in kitty.conf or with -o):
+
+    cursor_smooth_motion              no      enable the animation
+    cursor_smooth_motion_factor       0.2     fraction of the distance covered per 1/60 s
+    cursor_smooth_motion_spring       0.8     factor multiplier for the trailing edges
+    cursor_smooth_motion_max_stretch  3 2     max width/height while moving, in cursor sizes
+    cursor_smooth_motion_antijitter   50      min ms between changes of the target
+
+Apply with:  git apply kitty-smooth-cursor.patch   (or: patch -p1 < kitty-smooth-cursor.patch)
+If kitty/options/{parse.py,types.py,to-c-generated.h} conflict after an update,
+apply the rest with --exclude for those three files and regenerate them with
+./kitty/launcher/kitty +launch gen/config.py after building once.
+
+diff --git a/kitty/child-monitor.c b/kitty/child-monitor.c
+index 959c005ee..1cb731d7f 100644
+--- a/kitty/child-monitor.c
++++ b/kitty/child-monitor.c
+@@ -774,6 +774,7 @@ collect_cursor_info(CursorRenderInfo *ans, Window *w, monotonic_t now, OSWindow
+         ans->y = cursor->y;
+     }
+     ans->is_visible = false;
++    ans->smooth_motion_active = false;
+     ans->multicursor_count = 0;
+     ans->cursor_opacity = 1;
+     ans->text_blink_opacity = 1;
+@@ -908,6 +909,18 @@ prepare_to_render_os_window(
+                     if (tab->cursor_trail.target_updated) os_window->shader_anim_event_registry |= (1u << SHADER_ANIM_EVENT_CURSOR_TRAIL_MOVE);
+                     if (was_rendering && !tab->cursor_trail.needs_render) os_window->shader_anim_event_registry |= (1u << SHADER_ANIM_EVENT_CURSOR_TRAIL_STOP);
+                 }
++                if (OPT(cursor_smooth_motion)) {
++                    if (os_window->last_active_tab != os_window->active_tab && os_window->last_active_tab < os_window->num_tabs) {
++                        // glide from where the cursor was in the previous tab
++                        tab->smooth_cursor = os_window->tabs[os_window->last_active_tab].smooth_cursor;
++                    }
++                    if (update_smooth_cursor(&tab->smooth_cursor, w, now, os_window)) {
++                        needs_render = true;
++                        set_maximum_wait(MAX(OPT(repaint_delay), ms_to_monotonic_t(1ll)));
++                    }
++                    // the animated cursor is drawn by sampling the rendered frame
++                    if (tab->smooth_cursor.active) os_window->needs_layers = true;
++                }
+             } else {
+                 if (WD.screen->cursor_render_info.render_even_when_unfocused) {
+                     if (collect_cursor_info(&WD.screen->cursor_render_info, w, now, os_window)) needs_render = true;
+diff --git a/kitty/data-types.h b/kitty/data-types.h
+index 84a333d2d..50ce13354 100644
+--- a/kitty/data-types.h
++++ b/kitty/data-types.h
+@@ -271,6 +271,7 @@ typedef struct {
+ 
+ typedef struct {
+     bool is_focused, render_even_when_unfocused, is_visible;
++    bool smooth_motion_active; // the real cursor is hidden while cursor_smooth_motion animates it
+     CursorShape shape;
+     unsigned x, y, multicursor_count;
+     float cursor_opacity, text_blink_opacity;
+diff --git a/kitty/fast_data_types.pyi b/kitty/fast_data_types.pyi
+index 0831e6b5f..b6a70b28c 100644
+--- a/kitty/fast_data_types.pyi
++++ b/kitty/fast_data_types.pyi
+@@ -325,6 +325,7 @@ FC_SLANT_ROMAN: int
+ FC_SLANT_ITALIC: int
+ BORDERS_PROGRAM: int
+ TRAIL_PROGRAM: int
++SMOOTH_CURSOR_PROGRAM: int
+ PRESS: int
+ RELEASE: int
+ DRAG: int
+diff --git a/kitty/options/definition.py b/kitty/options/definition.py
+index 5f3e6c5a0..d55b35d79 100644
+--- a/kitty/options/definition.py
++++ b/kitty/options/definition.py
+@@ -511,6 +511,76 @@
+ """,
+ )
+ 
++opt(
++    'cursor_smooth_motion',
++    'no',
++    option_type='to_bool',
++    ctype='bool',
++    long_text="""
++Animate the cursor itself gliding to its new position, instead of jumping
++there. The cursor is drawn as a rectangle whose edges ease towards the edges of
++the real cursor, the edges on the side it is moving towards faster than the
++others, so that the cursor stretches while it travels. Changes of cursor shape
++are animated the same way. Text under the moving cursor stays readable. See
++:opt:`cursor_smooth_motion_factor`, :opt:`cursor_smooth_motion_spring`,
++:opt:`cursor_smooth_motion_max_stretch` and
++:opt:`cursor_smooth_motion_antijitter` to tune it. Combining this with
++:opt:`cursor_trail` works but you probably want only one of them.
++""",
++)
++
++opt(
++    'cursor_smooth_motion_factor',
++    '0.2',
++    option_type='unit_float',
++    ctype='float',
++    long_text="""
++How fast the cursor reaches its new position when :opt:`cursor_smooth_motion`
++is enabled. Each 1/60th of a second the leading edges of the cursor cover this
++fraction of the remaining distance, independent of the frame rate. A value of
++:code:`1` moves the cursor instantly.
++""",
++)
++
++opt(
++    'cursor_smooth_motion_spring',
++    '0.8',
++    option_type='unit_float',
++    ctype='float',
++    long_text="""
++Multiplier for :opt:`cursor_smooth_motion_factor` applied to the trailing
++edges of the cursor, the ones on the side opposite to the direction of motion.
++Smaller values stretch the cursor more while it moves, :code:`1` moves it
++without changing its shape.
++""",
++)
++
++opt(
++    'cursor_smooth_motion_max_stretch',
++    '3 2',
++    option_type='cursor_smooth_motion_max_stretch',
++    ctype='!cursor_smooth_motion_max_stretch',
++    long_text="""
++Limits how much larger than its final size the cursor can get while moving
++with :opt:`cursor_smooth_motion`, as a multiple of that size. Accepts one or
++two values, the first for the width and the second for the height. Values
++smaller than :code:`1` are treated as :code:`1`.
++""",
++)
++
++opt(
++    'cursor_smooth_motion_antijitter',
++    '50',
++    option_type='positive_int',
++    ctype='time-ms',
++    long_text="""
++The minimum time in milliseconds between two changes of the position the
++cursor moves towards when :opt:`cursor_smooth_motion` is enabled. Helps with
++programs that move the cursor around rapidly while redrawing their UI. Set to
++zero to always follow the cursor immediately.
++""",
++)
++
+ egr()  # }}}
+ 
+ # scrollback {{{
+diff --git a/kitty/options/parse.py b/kitty/options/parse.py
+index 9ee0049df..5cd1374b9 100644
+--- a/kitty/options/parse.py
++++ b/kitty/options/parse.py
+@@ -11,21 +11,21 @@
+     action_alias, active_tab_title_template, allow_hyperlinks, background_images, bell_on_tab,
+     box_drawing_scale, clear_all_mouse_actions, clear_all_shortcuts, clipboard_control,
+     clone_source_strategies, config_or_absolute_path, confirm_close, copy_on_select,
+-    cursor_blink_interval, cursor_text_color, cursor_trail_decay, cursor_trail_start_threshold,
+-    custom_shaders, deprecated_adjust_line_height, deprecated_hide_window_decorations_aliases,
+-    deprecated_macos_show_window_title_in_menubar_alias, deprecated_scrollback_indicator_opacity,
+-    deprecated_send_text, disable_ligatures, edge_width, env, filter_notification, font_features,
+-    hide_window_decorations, macos_option_as_alt, macos_titlebar_color, menu_map, modify_font,
+-    mouse_hide_wait, narrow_symbols, notify_on_cmd_finish, optional_edge_width, parse_font_spec,
+-    parse_map, parse_mouse_map, paste_actions, pointer_shape_when_dragging, remap_modifiers,
+-    remote_control_password, resize_debounce_time, scrollback_lines, scrollback_pager_history_size,
+-    scrollbar_color, shell_integration, show_hyperlink_targets, store_multiple, symbol_map,
+-    tab_activity_symbol, tab_bar_edge, tab_bar_margin_height, tab_bar_min_tabs, tab_fade,
+-    tab_font_style, tab_separator, tab_title_template, tab_title_wrap, text_fg_override_threshold,
+-    titlebar_color, to_cursor_shape, to_cursor_unfocused_shape, to_font_size, to_layout_names,
+-    to_modifiers, transparent_background_colors, underline_exclusion, url_prefixes, url_style,
+-    visual_bell_duration, visual_window_select_characters, window_border_width, window_logo_scale,
+-    window_size
++    cursor_blink_interval, cursor_smooth_motion_max_stretch, cursor_text_color, cursor_trail_decay,
++    cursor_trail_start_threshold, custom_shaders, deprecated_adjust_line_height,
++    deprecated_hide_window_decorations_aliases, deprecated_macos_show_window_title_in_menubar_alias,
++    deprecated_scrollback_indicator_opacity, deprecated_send_text, disable_ligatures, edge_width, env,
++    filter_notification, font_features, hide_window_decorations, macos_option_as_alt,
++    macos_titlebar_color, menu_map, modify_font, mouse_hide_wait, narrow_symbols, notify_on_cmd_finish,
++    optional_edge_width, parse_font_spec, parse_map, parse_mouse_map, paste_actions,
++    pointer_shape_when_dragging, remap_modifiers, remote_control_password, resize_debounce_time,
++    scrollback_lines, scrollback_pager_history_size, scrollbar_color, shell_integration,
++    show_hyperlink_targets, store_multiple, symbol_map, tab_activity_symbol, tab_bar_edge,
++    tab_bar_margin_height, tab_bar_min_tabs, tab_fade, tab_font_style, tab_separator,
++    tab_title_template, tab_title_wrap, text_fg_override_threshold, titlebar_color, to_cursor_shape,
++    to_cursor_unfocused_shape, to_font_size, to_layout_names, to_modifiers,
++    transparent_background_colors, underline_exclusion, url_prefixes, url_style, visual_bell_duration,
++    visual_window_select_characters, window_border_width, window_logo_scale, window_size
+ )
+ 
+ 
+@@ -938,6 +938,21 @@ def cursor_shape(self, val: str, ans: dict[str, typing.Any]) -> None:
+     def cursor_shape_unfocused(self, val: str, ans: dict[str, typing.Any]) -> None:
+         ans['cursor_shape_unfocused'] = to_cursor_unfocused_shape(val)
+ 
++    def cursor_smooth_motion(self, val: str, ans: dict[str, typing.Any]) -> None:
++        ans['cursor_smooth_motion'] = to_bool(val)
++
++    def cursor_smooth_motion_antijitter(self, val: str, ans: dict[str, typing.Any]) -> None:
++        ans['cursor_smooth_motion_antijitter'] = positive_int(val)
++
++    def cursor_smooth_motion_factor(self, val: str, ans: dict[str, typing.Any]) -> None:
++        ans['cursor_smooth_motion_factor'] = unit_float(val)
++
++    def cursor_smooth_motion_max_stretch(self, val: str, ans: dict[str, typing.Any]) -> None:
++        ans['cursor_smooth_motion_max_stretch'] = cursor_smooth_motion_max_stretch(val)
++
++    def cursor_smooth_motion_spring(self, val: str, ans: dict[str, typing.Any]) -> None:
++        ans['cursor_smooth_motion_spring'] = unit_float(val)
++
+     def cursor_stop_blinking_after(self, val: str, ans: dict[str, typing.Any]) -> None:
+         ans['cursor_stop_blinking_after'] = positive_float(val)
+ 
+diff --git a/kitty/options/to-c-generated.h b/kitty/options/to-c-generated.h
+index 1741319a9..8872ce53f 100644
+--- a/kitty/options/to-c-generated.h
++++ b/kitty/options/to-c-generated.h
+@@ -264,6 +264,71 @@ convert_from_opts_cursor_trail_color(PyObject *py_opts, Options *opts) {
+     Py_DECREF(ret);
+ }
+ 
++static void
++convert_from_python_cursor_smooth_motion(PyObject *val, Options *opts) {
++    opts->cursor_smooth_motion = PyObject_IsTrue(val);
++}
++
++static void
++convert_from_opts_cursor_smooth_motion(PyObject *py_opts, Options *opts) {
++    PyObject *ret = PyObject_GetAttrString(py_opts, "cursor_smooth_motion");
++    if (ret == NULL) return;
++    convert_from_python_cursor_smooth_motion(ret, opts);
++    Py_DECREF(ret);
++}
++
++static void
++convert_from_python_cursor_smooth_motion_factor(PyObject *val, Options *opts) {
++    opts->cursor_smooth_motion_factor = PyFloat_AsFloat(val);
++}
++
++static void
++convert_from_opts_cursor_smooth_motion_factor(PyObject *py_opts, Options *opts) {
++    PyObject *ret = PyObject_GetAttrString(py_opts, "cursor_smooth_motion_factor");
++    if (ret == NULL) return;
++    convert_from_python_cursor_smooth_motion_factor(ret, opts);
++    Py_DECREF(ret);
++}
++
++static void
++convert_from_python_cursor_smooth_motion_spring(PyObject *val, Options *opts) {
++    opts->cursor_smooth_motion_spring = PyFloat_AsFloat(val);
++}
++
++static void
++convert_from_opts_cursor_smooth_motion_spring(PyObject *py_opts, Options *opts) {
++    PyObject *ret = PyObject_GetAttrString(py_opts, "cursor_smooth_motion_spring");
++    if (ret == NULL) return;
++    convert_from_python_cursor_smooth_motion_spring(ret, opts);
++    Py_DECREF(ret);
++}
++
++static void
++convert_from_python_cursor_smooth_motion_max_stretch(PyObject *val, Options *opts) {
++    cursor_smooth_motion_max_stretch(val, opts);
++}
++
++static void
++convert_from_opts_cursor_smooth_motion_max_stretch(PyObject *py_opts, Options *opts) {
++    PyObject *ret = PyObject_GetAttrString(py_opts, "cursor_smooth_motion_max_stretch");
++    if (ret == NULL) return;
++    convert_from_python_cursor_smooth_motion_max_stretch(ret, opts);
++    Py_DECREF(ret);
++}
++
++static void
++convert_from_python_cursor_smooth_motion_antijitter(PyObject *val, Options *opts) {
++    opts->cursor_smooth_motion_antijitter = parse_ms_long_to_monotonic_t(val);
++}
++
++static void
++convert_from_opts_cursor_smooth_motion_antijitter(PyObject *py_opts, Options *opts) {
++    PyObject *ret = PyObject_GetAttrString(py_opts, "cursor_smooth_motion_antijitter");
++    if (ret == NULL) return;
++    convert_from_python_cursor_smooth_motion_antijitter(ret, opts);
++    Py_DECREF(ret);
++}
++
+ static void
+ convert_from_python_scrollbar(PyObject *val, Options *opts) {
+     opts->scrollbar = scrollbar(val);
+@@ -1619,6 +1684,16 @@ convert_opts_from_python_opts(PyObject *py_opts, Options *opts) {
+     if (PyErr_Occurred()) return false;
+     convert_from_opts_cursor_trail_color(py_opts, opts);
+     if (PyErr_Occurred()) return false;
++    convert_from_opts_cursor_smooth_motion(py_opts, opts);
++    if (PyErr_Occurred()) return false;
++    convert_from_opts_cursor_smooth_motion_factor(py_opts, opts);
++    if (PyErr_Occurred()) return false;
++    convert_from_opts_cursor_smooth_motion_spring(py_opts, opts);
++    if (PyErr_Occurred()) return false;
++    convert_from_opts_cursor_smooth_motion_max_stretch(py_opts, opts);
++    if (PyErr_Occurred()) return false;
++    convert_from_opts_cursor_smooth_motion_antijitter(py_opts, opts);
++    if (PyErr_Occurred()) return false;
+     convert_from_opts_scrollbar(py_opts, opts);
+     if (PyErr_Occurred()) return false;
+     convert_from_opts_scrollbar_interactive(py_opts, opts);
+diff --git a/kitty/options/to-c.h b/kitty/options/to-c.h
+index 70d8ddef5..2058d12d2 100644
+--- a/kitty/options/to-c.h
++++ b/kitty/options/to-c.h
+@@ -301,6 +301,12 @@ cursor_trail_start_threshold(PyObject *src, Options *opts) {
+     opts->cursor_trail_start_threshold_y = (int)PyLong_AsLong(PyTuple_GET_ITEM(src, 1));
+ }
+ 
++static inline void
++cursor_smooth_motion_max_stretch(PyObject *src, Options *opts) {
++    opts->cursor_smooth_motion_max_stretch_x = PyFloat_AsFloat(PyTuple_GET_ITEM(src, 0));
++    opts->cursor_smooth_motion_max_stretch_y = PyFloat_AsFloat(PyTuple_GET_ITEM(src, 1));
++}
++
+ static inline void
+ cursor_trail_color(PyObject *src, Options *opts) {
+     opts->cursor_trail_color = color_or_none_as_int(src);
+diff --git a/kitty/options/types.py b/kitty/options/types.py
+index 52801eebd..5a3d54c86 100644
+--- a/kitty/options/types.py
++++ b/kitty/options/types.py
+@@ -342,6 +342,11 @@
+     'cursor_blink_interval',
+     'cursor_shape',
+     'cursor_shape_unfocused',
++    'cursor_smooth_motion',
++    'cursor_smooth_motion_antijitter',
++    'cursor_smooth_motion_factor',
++    'cursor_smooth_motion_max_stretch',
++    'cursor_smooth_motion_spring',
+     'cursor_stop_blinking_after',
+     'cursor_text_color',
+     'cursor_trail',
+@@ -570,6 +575,11 @@ class Options:
+     cursor_blink_interval: tuple[float, kitty.options.utils.EasingFunction, kitty.options.utils.EasingFunction] = (-1.0, kitty.options.utils.EasingFunction(), kitty.options.utils.EasingFunction())
+     cursor_shape: int = 1
+     cursor_shape_unfocused: int = 4
++    cursor_smooth_motion: bool = False
++    cursor_smooth_motion_antijitter: int = 50
++    cursor_smooth_motion_factor: float = 0.2
++    cursor_smooth_motion_max_stretch: tuple[float, float] = (3.0, 2.0)
++    cursor_smooth_motion_spring: float = 0.8
+     cursor_stop_blinking_after: float = 15.0
+     cursor_text_color: kitty.fast_data_types.Color | None = Color(17, 17, 17)
+     cursor_trail: int = 0
+@@ -1724,4 +1734,4 @@ def __setattr__(self, key: str, val: typing.Any) -> typing.Any:
+ })
+ 
+ 
+-secret_options = ('remote_control_password', 'file_transfer_confirmation_bypass')
++secret_options = ('remote_control_password', 'file_transfer_confirmation_bypass')
+\ No newline at end of file
+diff --git a/kitty/options/utils.py b/kitty/options/utils.py
+index 2a49ce105..317da04b5 100644
+--- a/kitty/options/utils.py
++++ b/kitty/options/utils.py
+@@ -680,6 +680,16 @@ def cursor_trail_start_threshold(x: str) -> tuple[int, int]:
+     raise ValueError(f'cursor_trail_start_threshold must have 1 or 2 values, got: {x!r}')
+ 
+ 
++def cursor_smooth_motion_max_stretch(x: str) -> tuple[float, float]:
++    parts = x.split()
++    if len(parts) == 1:
++        val = max(1.0, positive_float(parts[0]))
++        return val, val
++    if len(parts) == 2:
++        return max(1.0, positive_float(parts[0])), max(1.0, positive_float(parts[1]))
++    raise ValueError(f'cursor_smooth_motion_max_stretch must have 1 or 2 values, got: {x!r}')
++
++
+ def scrollback_lines(x: str) -> int:
+     ans = int(x)
+     if ans < 0:
+diff --git a/kitty/shaders.c b/kitty/shaders.c
+index f38d81549..98eb8804d 100644
+--- a/kitty/shaders.c
++++ b/kitty/shaders.c
+@@ -31,6 +31,7 @@ enum {
+     BGIMAGE_PROGRAM,
+     TINT_PROGRAM,
+     TRAIL_PROGRAM,
++    SMOOTH_CURSOR_PROGRAM,
+     BLIT_PROGRAM,
+     SCREENSHOT_PROGRAM,
+     ROUNDED_RECT_PROGRAM,
+@@ -992,9 +993,10 @@ cell_update_uniform_block(
+         }
+         // store last rendered cursor color for trail rendering
+         screen->last_rendered.cursor_bg = main_cursor_bg;
+-        if (!cursor->is_visible) {
++        if (!cursor->is_visible || cursor->smooth_motion_active) {
+             // Move the main cursor off screen so that only it is hidden, the
+-            // extra cursors keep their shape and colors.
++            // extra cursors keep their shape and colors. With smooth motion
++            // the animated cursor is drawn instead, see draw_smooth_cursor().
+             rd->cursor_x1 = screen->columns + 1;
+             rd->cursor_x2 = screen->columns;
+             rd->cursor_y1 = screen->lines + 1;
+@@ -1216,6 +1218,8 @@ set_cell_uniforms(bool force) {
+ #undef set_optional
+         bind_program(BLIT_PROGRAM);
+         glUniform1i(program_uniform_location(BLIT_PROGRAM, "image"), GRAPHICS_UNIT);
++        bind_program(SMOOTH_CURSOR_PROGRAM);
++        glUniform1i(program_uniform_location(SMOOTH_CURSOR_PROGRAM, "image"), GRAPHICS_UNIT);
+         bind_program(SCREENSHOT_PROGRAM);
+         glUniform1i(program_uniform_location(SCREENSHOT_PROGRAM, "image"), GRAPHICS_UNIT);
+         constants_set = true;
+@@ -2320,6 +2324,53 @@ draw_cursor_trail(CursorTrail *trail, Window *active_window) {
+ 
+ // }}}
+ 
++// Smooth cursor {{{
++static void
++srgb_vec3(GLint location, color_type color) {
++    glUniform3f(location, ((color >> 16) & 0xFF) / 255.f, ((color >> 8) & 0xFF) / 255.f, (color & 0xFF) / 255.f);
++}
++
++// Must be called after the frame has been rendered to the layers texture and
++// blitted to the output, the cursor is drawn over the output using the layers
++// texture for the colors below it
++static void
++draw_smooth_cursor(OSWindow *os_window, const SmoothCursor *sc, Window *active_window, float sx, float sy) {
++    if (!active_window || !active_window->render_data.screen) return;
++    Screen *screen = active_window->render_data.screen;
++    // follow blinking so that handing over to the real cursor is seamless
++    const float alpha = sc->alpha * MAX(0.f, MIN(screen->cursor_render_info.cursor_opacity, 1.f));
++    if (alpha <= 0.f) return;
++    const float vw = (float)os_window->viewport_width, vh = (float)os_window->viewport_height;
++    // move with the text during a partial line pixel scroll, like the real cursor
++    const float dy = pixel_scroll_enabled(screen) ? (float)screen->pixel_scroll_offset_y : 0.f;
++    const float left = -1.f + 2.f * sc->rect[0] / vw, top = 1.f - 2.f * (sc->rect[1] + dy) / vh;
++    const float right = -1.f + 2.f * sc->rect[2] / vw, bottom = 1.f - 2.f * (sc->rect[3] + dy) / vh;
++    ColorProfile *cp = screen->paused_rendering.expires_at ? &screen->paused_rendering.color_profile : screen->color_profile;
++#define U(name) program_uniform_location(SMOOTH_CURSOR_PROGRAM, name)
++    bind_program(SMOOTH_CURSOR_PROGRAM);
++    glActiveTexture(GL_TEXTURE0 + GRAPHICS_UNIT);
++    glBindTexture(GL_TEXTURE_2D, global_state.layers_render_texture.texture_id);
++    // texture co-ordinates are bottom up and scaled as for the blit in stop_os_window_rendering()
++    glUniform4f(U("src_rect"), (left + 1.f) * 0.5f * sx, (top + 1.f) * 0.5f * sy, (right + 1.f) * 0.5f * sx, (bottom + 1.f) * 0.5f * sy);
++    glUniform4f(U("dest_rect"), left, top, right, bottom);
++    glUniform2f(U("size_px"), sc->rect[2] - sc->rect[0], sc->rect[3] - sc->rect[1]);
++    srgb_vec3(U("cursor_color"), screen->last_rendered.cursor_bg);
++    srgb_vec3(U("bg_color"), colorprofile_to_color(cp, cp->overridden.default_bg, cp->configured.default_bg).rgb);
++    if (sc->hollow) {
++        // same thickness as add_hollow_cursor() in decorations.c
++        glUniform2f(
++            U("hollow_thickness"),
++            MAX(1.f, roundf((float)os_window->fonts_data->logical_dpi_x / 72.f)),
++            MAX(1.f, roundf((float)os_window->fonts_data->logical_dpi_y / 72.f)));
++    } else glUniform2f(U("hollow_thickness"), 0.f, 0.f);
++    glUniform1f(U("alpha"), alpha);
++#undef U
++    draw_quad(true, 0);
++    unbind_program();
++}
++
++// }}}
++
+ // OSWindow {{{
+ static void
+ draw_bg_image(OSWindow *os_window, Tab *tab) {
+@@ -2903,6 +2954,7 @@ stop_os_window_rendering(OSWindow *os_window, Tab *tab, Window *active_window, m
+                 save_viewport_using_top_left_origin(0, 0, os_window->viewport_width, os_window->viewport_height, os_window->live_resize.height);
+             draw_quad(false, 0);
+         }
++        if (OPT(cursor_smooth_motion) && tab->smooth_cursor.active) draw_smooth_cursor(os_window, &tab->smooth_cursor, active_window, sx, sy);
+         if (os_window->live_resize.in_progress) {
+             restore_viewport();
+             draw_resizing_text(os_window);
+@@ -3397,6 +3449,7 @@ init_shaders(PyObject *module) {
+     C(BGIMAGE_PROGRAM);
+     C(TINT_PROGRAM);
+     C(TRAIL_PROGRAM);
++    C(SMOOTH_CURSOR_PROGRAM);
+     C(BLIT_PROGRAM);
+     C(SCREENSHOT_PROGRAM);
+     C(ROUNDED_RECT_PROGRAM);
+diff --git a/kitty/shaders/slang.py b/kitty/shaders/slang.py
+index 062b059ef..af21ea10e 100644
+--- a/kitty/shaders/slang.py
++++ b/kitty/shaders/slang.py
+@@ -51,6 +51,7 @@
+     REVERSE,
+     ROUNDED_RECT_PROGRAM,
+     SCREENSHOT_PROGRAM,
++    SMOOTH_CURSOR_PROGRAM,
+     STRIKETHROUGH,
+     TINT_PROGRAM,
+     TRAIL_PROGRAM,
+@@ -243,6 +244,7 @@ def cell(prog: int) -> None:
+             'bgimage': BGIMAGE_PROGRAM,
+             'tint': TINT_PROGRAM,
+             'trail': TRAIL_PROGRAM,
++            'smooth_cursor': SMOOTH_CURSOR_PROGRAM,
+             'blit': BLIT_PROGRAM,
+             'screenshot': SCREENSHOT_PROGRAM,
+             'rounded_rect': ROUNDED_RECT_PROGRAM,
+diff --git a/kitty/shaders/smooth_cursor.slang b/kitty/shaders/smooth_cursor.slang
+new file mode 100644
+index 000000000..25a8aa4ac
+--- /dev/null
++++ b/kitty/shaders/smooth_cursor.slang
+@@ -0,0 +1,57 @@
++#language slang 2026
++// Distributed under terms of the GPLv3 license.
++
++// The animated cursor of cursor_smooth_motion, a port of the DRAW_INVERTING
++// rect shader of alacritty-smooth-cursor. It is drawn after the frame has
++// been rendered and samples the frame below itself, so that text stays
++// readable while the cursor travels over it.
++
++import blit_common;
++import linear2srgb;
++
++struct VSOutput {
++    float2 texcoord : TEXCOORD0;
++    float2 pixel : TEXCOORD1; // position relative to the top left corner of the cursor, in pixels
++    float2 size : TEXCOORD2;  // size of the cursor, in pixels
++    float4 position : SV_Position;
++};
++
++[shader("vertex")]
++VSOutput
++vertex_main(uint vertex_id: SV_VertexID, uniform float4 src_rect, uniform float4 dest_rect, uniform float2 size_px) {
++    BlitOutput ans = get_coords_for_blit(vertex_id, src_rect, dest_rect);
++    VSOutput output;
++    output.texcoord = ans.texcoord;
++    output.pixel = get_coords_for_blit(vertex_id, float4(0.0, 0.0, size_px.x, size_px.y), dest_rect).texcoord;
++    output.size = size_px;
++    output.position = float4(ans.position[0], ans.position[1], 0.0, 1.0);
++    return output;
++}
++
++uniform Sampler2D image;
++
++[shader("fragment")]
++float4
++fragment_main(
++    float2 texcoord: TEXCOORD0, float2 pixel: TEXCOORD1, float2 size: TEXCOORD2,
++    uniform float3 cursor_color, uniform float3 bg_color, uniform float2 hollow_thickness, uniform float alpha)
++    : SV_Target {
++    // The frame is premultiplied linear color, the original works in sRGB
++    float4 below_premul = image.Sample(texcoord);
++    float3 below = below_premul.a > 0.0 ? linear2srgb(below_premul.rgb / below_premul.a) : float3(0.0);
++    // How far the pixel is from the background, i.e. how much of it is text
++    float factor = length(bg_color - below);
++    // If the text is too close to the cursor color, either dim or brighten it
++    // so that their values are at least 0.5 apart
++    float3 text = below;
++    float v_cursor = max(cursor_color.r, max(cursor_color.g, cursor_color.b));
++    float v_text = max(text.r, max(text.g, text.b));
++    if (v_text != 0.0 && abs(v_cursor - v_text) < 0.5) {
++        text *= (v_cursor > 0.5 ? v_cursor - 0.5 : v_cursor + 0.5) / v_text;
++    }
++    float3 color = saturate(lerp(cursor_color, text, factor));
++    // Hollow cursors draw only their outline
++    float2 inside = step(hollow_thickness, pixel) * step(pixel, size - hollow_thickness);
++    float a = alpha * (1.0 - inside.x * inside.y * step(0.5, hollow_thickness.x));
++    return float4(color * a, a);
++}
+diff --git a/kitty/smooth_cursor.c b/kitty/smooth_cursor.c
+new file mode 100644
+index 000000000..4d50bf2b7
+--- /dev/null
++++ b/kitty/smooth_cursor.c
+@@ -0,0 +1,183 @@
++/*
++ * smooth_cursor.c
++ * Distributed under terms of the GPLv3 license.
++ *
++ * Smooth cursor motion, ported from alacritty-smooth-cursor
++ * (https://github.com/GregTheMadMonk/alacritty-smooth-cursor).
++ *
++ * The cursor is drawn as a rectangle whose four edges independently ease
++ * towards the edges of the real cursor. The edges on the side the cursor is
++ * moving towards use cursor_smooth_motion_factor, the trailing edges use
++ * cursor_smooth_motion_factor * cursor_smooth_motion_spring, so the cursor
++ * stretches while it travels. The stretch is capped by
++ * cursor_smooth_motion_max_stretch. While the animation runs the real cursor
++ * is hidden and the rectangle is drawn by draw_smooth_cursor() instead.
++ */
++
++#include "state.h"
++#include "lineops.h"
++
++#define WD w->render_data
++enum { LEFT, TOP, RIGHT, BOTTOM };
++
++// Below this the rect is considered to have reached its target, the same
++// tolerance alacritty-smooth-cursor uses (it compares rounded pixels)
++#define POSITION_TOLERANCE 0.5f
++#define ALPHA_TOLERANCE (1.f / 255.f)
++
++static float
++lerp(float a, float b, float f) {
++    return a * (1.f - f) + b * f;
++}
++
++// The factors are specified as the fraction of the remaining distance covered
++// per 1/60th of a second. Convert to the fraction for a step of dt seconds so
++// that the animation speed does not depend on the frame rate.
++static float
++step_fraction(float factor, float dt) {
++    if (factor >= 1.f) return 1.f;
++    if (factor <= 0.f) return 0.f;
++    return 1.f - powf(1.f - factor, dt * 60.f);
++}
++
++static unsigned
++thickness_in_px(float pts, double dpi, unsigned cell_dimension) {
++    // Same as vert()/horz() in decorations.c so the animated cursor ends up
++    // exactly the size of the real one
++    unsigned ans = (unsigned)round(pts * dpi / 72.0);
++    return MAX(1u, MIN(ans, cell_dimension));
++}
++
++static void
++compute_target(Window *w, OSWindow *os_window, float target[4], float *alpha, bool *hollow) {
++    Screen *screen = WD.screen;
++    const CursorRenderInfo *cri = &screen->cursor_render_info;
++    const float cw = screen->cell_size.width, ch = screen->cell_size.height;
++    const float left = WD.geometry.left + cri->x * cw, top = WD.geometry.top + cri->y * ch;
++    CursorShape shape = (cri->is_focused || OPT(cursor_shape_unfocused) == NO_CURSOR_SHAPE) ? cri->shape : OPT(cursor_shape_unfocused);
++    // A hidden cursor animates as an invisible block, like in the original
++    *alpha = cri->is_visible ? 1.f : 0.f;
++    if (!cri->is_visible) shape = CURSOR_BLOCK;
++    // Cursors on multicell characters are enlarged, see cell_update_uniform_block() in shaders.c
++    unsigned cols = 1, rows = 1;
++    if (cri->x < screen->columns && cri->y < screen->lines) {
++        LineBuf *lb = screen->paused_rendering.expires_at ? screen->paused_rendering.linebuf : screen->linebuf;
++        linebuf_init_line(lb, cri->y);
++        const CPUCell *c = &lb->line->cpu_cells[cri->x];
++        if (c->is_multicell && c->x == 0 && c->y == 0) {
++            cols = mcd_x_limit(c);
++            rows = c->scale;
++        }
++    }
++    target[LEFT] = left;
++    target[TOP] = top;
++    target[RIGHT] = left + cols * cw;
++    target[BOTTOM] = top + rows * ch;
++    *hollow = false;
++    switch (shape) {
++        case CURSOR_BEAM:
++            target[RIGHT] = left + thickness_in_px(OPT(cursor_beam_thickness), os_window->fonts_data->logical_dpi_x, screen->cell_size.width);
++            break;
++        case CURSOR_UNDERLINE:
++            target[TOP] = target[BOTTOM] - thickness_in_px(OPT(cursor_underline_thickness), os_window->fonts_data->logical_dpi_y, screen->cell_size.height);
++            break;
++        case CURSOR_HOLLOW:
++            target[RIGHT] = left + cw;
++            target[BOTTOM] = top + ch;
++            *hollow = true;
++            break;
++        default: break;
++    }
++}
++
++static bool
++rects_equal(const float a[4], const float b[4]) {
++    return a[LEFT] == b[LEFT] && a[TOP] == b[TOP] && a[RIGHT] == b[RIGHT] && a[BOTTOM] == b[BOTTOM];
++}
++
++static bool
++rects_close(const float a[4], const float b[4]) {
++    for (int i = 0; i < 4; i++) {
++        if (fabsf(a[i] - b[i]) >= POSITION_TOLERANCE) return false;
++    }
++    return true;
++}
++
++static void
++snap_to_target(SmoothCursor *sc) {
++    memcpy(sc->rect, sc->target, sizeof(sc->rect));
++    sc->alpha = sc->target_alpha;
++}
++
++// RenderRect::interpolate() from alacritty-smooth-cursor
++static void
++animate(SmoothCursor *sc, float dt) {
++    const float factor = MAX(0.01f, OPT(cursor_smooth_motion_factor));
++    const float spring = MAX(0.01f, OPT(cursor_smooth_motion_spring));
++    const float leading = step_fraction(factor, dt), trailing = step_fraction(factor * spring, dt);
++    const float *t = sc->target;
++    float *r = sc->rect;
++    const float dx = t[LEFT] - r[LEFT], dy = t[TOP] - r[TOP];
++
++    float x1 = lerp(r[LEFT], t[LEFT], dx < 0 ? leading : trailing);
++    float y1 = lerp(r[TOP], t[TOP], dy < 0 ? leading : trailing);
++    float x2 = lerp(r[RIGHT], t[RIGHT], dx > 0 ? leading : trailing);
++    float y2 = lerp(r[BOTTOM], t[BOTTOM], dy > 0 ? leading : trailing);
++
++    // Limit the stretch by holding back the leading edges
++    const float width = MIN(x2 - x1, (t[RIGHT] - t[LEFT]) * OPT(cursor_smooth_motion_max_stretch_x));
++    const float height = MIN(y2 - y1, (t[BOTTOM] - t[TOP]) * OPT(cursor_smooth_motion_max_stretch_y));
++    if (dx < 0) x1 = x2 - width;
++    else x2 = x1 + width;
++    if (dy < 0) y1 = y2 - height;
++    else y2 = y1 + height;
++
++    r[LEFT] = x1;
++    r[TOP] = y1;
++    r[RIGHT] = x2;
++    r[BOTTOM] = y2;
++    sc->alpha = lerp(sc->alpha, sc->target_alpha, step_fraction(factor / 3.f, dt));
++}
++
++bool
++update_smooth_cursor(SmoothCursor *sc, Window *w, monotonic_t now, OSWindow *os_window) {
++    const bool was_active = sc->active;
++    float target[4], target_alpha;
++    bool hollow, pending = false;
++    compute_target(w, os_window, target, &target_alpha, &hollow);
++
++    // Antijitter: the target follows the cursor at most once every
++    // cursor_smooth_motion_antijitter, so that cursors jumping around during
++    // UI updates are not chased
++    if (!sc->has_target || !rects_equal(target, sc->target) || target_alpha != sc->target_alpha || hollow != sc->hollow) {
++        const monotonic_t wait = sc->target_set_at + OPT(cursor_smooth_motion_antijitter) - now;
++        if (!sc->has_target || wait <= 0) {
++            memcpy(sc->target, target, sizeof(sc->target));
++            sc->target_alpha = target_alpha;
++            sc->hollow = hollow;
++            sc->target_set_at = now;
++            sc->has_target = true;
++        } else pending = true; // keeps the animation running until the target can move
++    }
++
++    if (!sc->has_rect || os_window->live_resize.in_progress || (sc->target_alpha == 0.f && sc->alpha < ALPHA_TOLERANCE)) {
++        // Nothing to animate from, or nothing visible to animate
++        snap_to_target(sc);
++        sc->has_rect = true;
++    } else if (!was_active) {
++        // The first frame after the cursor was at rest only starts the
++        // animation, the time since the previous step is meaningless
++    } else {
++        animate(sc, (float)monotonic_t_to_s_double(now - sc->updated_at));
++    }
++    sc->updated_at = now;
++
++    const bool settled = rects_close(sc->rect, sc->target) && fabsf(sc->alpha - sc->target_alpha) < ALPHA_TOLERANCE;
++    if (settled) snap_to_target(sc);
++    sc->active = pending || !settled;
++    WD.screen->cursor_render_info.smooth_motion_active = sc->active;
++    // Render while animating and once more to bring back the real cursor
++    return sc->active || was_active;
++}
++
++#undef WD
+diff --git a/kitty/state.h b/kitty/state.h
+index d6e94b60a..170ab2324 100644
+--- a/kitty/state.h
++++ b/kitty/state.h
+@@ -71,6 +71,12 @@ typedef struct Options {
+     color_type cursor_trail_color;
+     int cursor_trail_start_threshold_x;
+     int cursor_trail_start_threshold_y;
++    bool cursor_smooth_motion;
++    float cursor_smooth_motion_factor;
++    float cursor_smooth_motion_spring;
++    float cursor_smooth_motion_max_stretch_x;
++    float cursor_smooth_motion_max_stretch_y;
++    monotonic_t cursor_smooth_motion_antijitter;
+     unsigned int url_style;
+     unsigned int scrollback_pager_history_size;
+     bool scrollback_fill_enlarged_window;
+@@ -447,12 +453,23 @@ typedef struct CursorTrail {
+     float prev_cursor_edge_y[2]; // cursor_edge_y before the most recent cursor move
+ } CursorTrail;
+ 
++typedef struct SmoothCursor {
++    bool active; // the animated cursor is drawn and the real one hidden
++    bool has_target, has_rect, hollow;
++    monotonic_t updated_at;    // time of the last animation step
++    monotonic_t target_set_at; // time the current target was accepted, for antijitter
++    float target[4];           // left, top, right, bottom in OS window pixels
++    float rect[4];             // the rect currently drawn, same layout as target
++    float target_alpha, alpha;
++} SmoothCursor;
++
+ typedef struct Tab {
+     id_type id;
+     unsigned int active_window, num_windows, capacity;
+     Window *windows;
+     BorderRects border_rects;
+     CursorTrail cursor_trail;
++    SmoothCursor smooth_cursor;
+ } Tab;
+ 
+ enum RENDER_STATE { RENDER_FRAME_NOT_REQUESTED, RENDER_FRAME_REQUESTED, RENDER_FRAME_READY };
+@@ -733,6 +750,7 @@ void upload_gamma_lut(void);
+ bool send_cell_data_to_gpu(ssize_t, Screen *, OSWindow *);
+ void draw_cells(const WindowRenderData *, OSWindow *, bool, bool, bool, Window *, monotonic_t);
+ bool update_cursor_trail(CursorTrail *ct, Window *w, monotonic_t now, OSWindow *os_window);
++bool update_smooth_cursor(SmoothCursor *sc, Window *w, monotonic_t now, OSWindow *os_window);
+ void set_gpu_viewport(unsigned w, unsigned h);
+ void free_texture(uint32_t *);
+ void free_framebuffer(uint32_t *);

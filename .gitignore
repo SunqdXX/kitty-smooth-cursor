@@ -1,0 +1,10 @@
+# kitty build tree, cloned and patched by rebuild-kitty-smooth.sh
+/kitty/
+# local slangc, see README
+/toolchain/
+# reference clones used while porting
+/alacritty/
+/alacritty-smooth-cursor/
+# build output
+*.log
+/linux-package/
